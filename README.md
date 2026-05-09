@@ -81,27 +81,11 @@ Test Matrix: .so Load Order vs Kernel Call
   F: load plain -> load evt -> call evt                   [PASS]
 ```
 
-### Inductor-Level Reproducer
-
-This uses `torch.compile` with CUTLASS EVT epilogue fusion enabled.
-**Requires PyTorch with [PR #181854](https://github.com/pytorch/pytorch/pull/181854) merged.**
-
-```bash
-python repro_inductor.py
-```
-
-**Expected output** on affected hardware:
-```
-❌ DEVICE_LOST — Bug reproduced!
-  Error: level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)
-```
-
 ## Files
 
 | File | Description |
 |------|-------------|
 | `standalone_repro_evt.py` | Self-contained reproducer with 6-test load-order matrix |
-| `repro_inductor.py` | Inductor-level reproducer via `torch.compile` |
 | `_inductor_kernel1_plain.sycl` | Exact inductor-generated plain GEMM SYCL source |
 | `_inductor_kernel2_evt.sycl` | Exact inductor-generated EVT GEMM SYCL source |
 | `evt_device_lost_analysis.md` | Detailed root cause analysis and debugging history |
