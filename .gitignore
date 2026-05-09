@@ -1,0 +1,6 @@
+_build_standalone/
+__pycache__/
+*.o
+*.so
+*.d
+tensor_hash_trace.log
