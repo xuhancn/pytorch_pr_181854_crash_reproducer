@@ -56,11 +56,24 @@ pip install --pre torch pytorch-triton-xpu --index-url https://download.pytorch.
 
 ## Usage
 
-### Standalone Reproducer (recommended)
+### Option 1: Pure C++ Reproducer (no PyTorch)
 
-This compiles the exact inductor-generated SYCL kernels as two separate `.so` files
-and runs a 6-test load-order matrix. **Works with any PyTorch version** that has XPU
-support.
+Zero Python/PyTorch dependency — only requires `icpx` (oneAPI) and the `sycl-tla`
+submodule. Builds two CUTLASS kernel `.so` files and a C++ test harness, then runs
+the 6-test load-order matrix.
+
+```bash
+source /opt/intel/oneapi/setvars.sh  # or ~/intel/oneapi/setvars.sh
+./build_and_run.sh
+```
+
+Options:
+- `--build-only` — Just compile, don't run tests
+
+### Option 2: Python Reproducer (requires PyTorch XPU)
+
+Uses PyTorch for GPU memory allocation and SYCL queue access. Compiles kernels
+via `icpx` and tests load order via `ctypes.CDLL`.
 
 ```bash
 python standalone_repro_evt.py
@@ -70,22 +83,27 @@ Options:
 - `--no-xs` — Disable IGC backend optimization flags
 - `--build-only` — Just compile, don't run tests
 
-**Expected output** on affected hardware:
+### Expected Output
+
+On affected hardware, both reproducers produce:
+
 ```
 Test Matrix: .so Load Order vs Kernel Call
   A: plain only                                           [PASS]
-  B: evt only                                             [PASS]
-  C: load plain -> load evt -> call plain  [BUG]          [FAIL]
-  D: load evt -> load plain -> call plain                 [PASS]
-  E: load plain -> call plain -> load evt -> call plain   [PASS]
-  F: load plain -> load evt -> call evt                   [PASS]
+  B: EVT only                                             [PASS]
+  C: load plain -> load EVT -> call plain  [BUG]          [FAIL]
+  D: load EVT -> load plain -> call plain                 [PASS]
+  E: load+call plain -> load EVT -> call plain            [PASS]
+  F: load plain -> load EVT -> call EVT                   [PASS]
 ```
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `standalone_repro_evt.py` | Self-contained reproducer with 6-test load-order matrix |
+| `repro_no_pytorch.cpp` | Pure C++ test harness (no PyTorch dependency) |
+| `build_and_run.sh` | Build script for C++ reproducer |
+| `standalone_repro_evt.py` | Python reproducer with PyTorch XPU |
 | `_inductor_kernel1_plain.sycl` | Exact inductor-generated plain GEMM SYCL source |
 | `_inductor_kernel2_evt.sycl` | Exact inductor-generated EVT GEMM SYCL source |
 | `evt_device_lost_analysis.md` | Detailed root cause analysis and debugging history |
@@ -104,7 +122,7 @@ Test Matrix: .so Load Order vs Kernel Call
 | GPU | Intel Arc Pro B60 (BMG/Xe2, 0xE20B) |
 | Level Zero Loader | 1.28.0 |
 | GPU Driver | 1.14.37435+12 (NEO 26.09.37435.12) |
-| sycl-tla | v0.8 (latest main) |
+| sycl-tla | v0.9 (latest main) |
 | PyTorch | 2.13.0a0+git8f75890 / 2.13.0.dev20260506+xpu |
 | icpx | oneAPI 2025.3 |
 
