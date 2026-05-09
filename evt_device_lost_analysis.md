@@ -204,6 +204,26 @@ Additional useful torch log options (see [torch logs tutorial](https://docs.pyto
 8. Confirmed: inductor's `.so` files have the same behavior (not a compilation issue)
 9. Root cause confirmed: Level Zero / SYCL runtime multi-`.so` device code corruption
 
+## Minimal Reproducer Investigation
+
+Tested progressively complex SYCL kernels **without CUTLASS** to determine if the
+bug can be reproduced with simpler code:
+
+| Kernel type | .so size | Load A → Load B → Call A | Result |
+|-------------|----------|--------------------------|--------|
+| Trivial `parallel_for` (vector_add) | 34 KB | ✅ PASS | No crash |
+| Subgroup ops (shuffle, reduce) | 34 KB | ✅ PASS | No crash |
+| Subgroup + full `-Xs` IGC flags | 34 KB | ✅ PASS | No crash |
+| **CUTLASS plain GEMM** | **185 KB** | **❌ DEVICE_LOST** | Crash |
+| **CUTLASS EVT GEMM** | **206 KB** | **❌ DEVICE_LOST** | Crash |
+
+**Conclusion**: The bug only manifests with large/complex SPIR-V modules generated
+by CUTLASS template instantiations. Simple SYCL kernels — even with identical compile
+flags (`-fsycl-targets=intel_gpu_bmg_g21`, `-Xs` IGC backend options, SPIR-V extension
+flags) — do not trigger the bug. The ~6x size difference (34 KB vs 185+ KB) suggests
+that SPIR-V binary size or internal module complexity is a contributing factor in the
+Level Zero runtime's device code registration corruption.
+
 ## Environment
 
 | Component | Version |
