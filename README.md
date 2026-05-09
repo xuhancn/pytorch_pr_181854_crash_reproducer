@@ -108,6 +108,12 @@ Test Matrix: .so Load Order vs Kernel Call
 | PyTorch | 2.13.0a0+git8f75890 / 2.13.0.dev20260506+xpu |
 | icpx | oneAPI 2025.3 |
 
+## Detailed Analysis
+
+See [evt_device_lost_analysis.md](evt_device_lost_analysis.md) for the full root cause
+analysis, inductor compilation model details, debugging history, and `TORCH_LOGS`
+instructions.
+
 ## Related Links
 
 - [PyTorch PR #181854](https://github.com/pytorch/pytorch/pull/181854) — CUTLASS EVT SiLU epilogue fusion for XPU
