@@ -18,16 +18,17 @@ Level Zero runtime **invalidates the first `.so`'s un-JIT'd SPIR-V device code**
 when loading the second. Calling the first kernel then executes corrupted code
 → `DEVICE_LOST`.
 
-The bug is **load-order dependent**:
+The bug is **load-order dependent** and **Intel Level Zero-specific** (confirmed by
+CUDA apple-to-apple testing — see [CUDA comparison](#cuda-comparison) below):
 
-| Test | Sequence | Result |
-|------|----------|--------|
-| A | plain kernel only | ✅ PASS |
-| B | EVT kernel only | ✅ PASS |
-| **C** | **load plain → load EVT → call plain** | **❌ DEVICE_LOST** |
-| D | load EVT → load plain → call plain | ✅ PASS |
-| E | load plain → call plain → load EVT → call plain | ✅ PASS |
-| F | load plain → load EVT → call EVT | ✅ PASS |
+| Test | Sequence | XPU (BMG) | CUDA (RTX 5090 D) |
+|------|----------|-----------|-------------------|
+| A | plain kernel only | ✅ PASS | ✅ PASS |
+| B | EVT kernel only | ✅ PASS | ✅ PASS |
+| **C** | **load plain → load EVT → call plain** | **❌ DEVICE_LOST** | **✅ PASS** |
+| D | load EVT → load plain → call plain | ✅ PASS | ✅ PASS |
+| E | load plain → call plain → load EVT → call plain | ✅ PASS | ✅ PASS |
+| F | load plain → load EVT → call EVT | ✅ PASS | ✅ PASS |
 
 Test C exactly matches PyTorch inductor's compilation pattern.
 
@@ -83,9 +84,31 @@ Options:
 - `--no-xs` — Disable IGC backend optimization flags
 - `--build-only` — Just compile, don't run tests
 
-### Expected Output
+### Option 3: CUDA Comparison (Apple-to-Apple)
 
-On affected hardware, both reproducers produce:
+Proves the same dlopen pattern works correctly on NVIDIA CUDA. Requires an NVIDIA GPU
+and `nvcc`.
+
+```bash
+python test_cuda_multi_so_dlopen.py
+```
+
+**Expected output** on any NVIDIA GPU:
+```
+CUDA Test Matrix: .so Load Order vs Kernel Call
+  A: plain only                                           [PASS]
+  B: evt only                                             [PASS]
+  C: load plain -> load evt -> call plain  [XPU BUG]      [PASS]
+  D: load evt -> load plain -> call plain                 [PASS]
+  E: load plain -> call plain -> load evt -> call plain   [PASS]
+  F: load plain -> load evt -> call evt                   [PASS]
+
+  ✅ ALL 6 TESTS PASS on CUDA
+```
+
+### Expected Output (XPU)
+
+On affected Intel hardware, both XPU reproducers produce:
 
 ```
 Test Matrix: .so Load Order vs Kernel Call
@@ -104,9 +127,11 @@ Test Matrix: .so Load Order vs Kernel Call
 | `repro_no_pytorch.cpp` | Pure C++ test harness (no PyTorch dependency) |
 | `build_and_run.sh` | Build script for C++ reproducer |
 | `standalone_repro_evt.py` | Python reproducer with PyTorch XPU |
+| `test_cuda_multi_so_dlopen.py` | **CUDA apple-to-apple comparison** (proves CUDA handles multi-.so correctly) |
 | `_inductor_kernel1_plain.sycl` | Exact inductor-generated plain GEMM SYCL source |
 | `_inductor_kernel2_evt.sycl` | Exact inductor-generated EVT GEMM SYCL source |
 | `evt_device_lost_analysis.md` | Detailed root cause analysis and debugging history |
+| `cuda_test_results.md` | Full CUDA validation test results (RTX 5090 D, SM120) |
 | `third_party/sycl-tla/` | CUTLASS for Intel GPUs (git submodule) |
 
 ## Workarounds
@@ -115,15 +140,27 @@ Test Matrix: .so Load Order vs Kernel Call
 2. **Reverse load order**: Load the EVT kernel `.so` before the plain kernel `.so`
 3. **Single `.so`**: Combine both kernels into one shared library
 
+## CUDA Comparison
+
+The same 6-test load-order matrix was run on NVIDIA CUDA (RTX 5090 D, SM120) as an
+apple-to-apple comparison. **All 6 tests pass on CUDA**, confirming the DEVICE_LOST
+crash is specific to Intel Level Zero / SYCL runtime, not a general GPU driver issue.
+
+See [cuda_test_results.md](cuda_test_results.md) for full details including environment
+setup, EVT unit test results, and SM120 architecture analysis.
+
 ## Environment Tested
 
 | Component | Version |
 |-----------|---------|
-| GPU | Intel Arc Pro B60 (BMG/Xe2, 0xE20B) |
+| GPU (XPU) | Intel Arc Pro B60 (BMG/Xe2, 0xE20B) |
+| GPU (CUDA) | NVIDIA GeForce RTX 5090 D (SM120, Blackwell) |
 | Level Zero Loader | 1.28.0 |
-| GPU Driver | 1.14.37435+12 (NEO 26.09.37435.12) |
+| GPU Driver (Intel) | 1.14.37435+12 (NEO 26.09.37435.12) |
+| CUDA Toolkit | 13.0 |
 | sycl-tla | v0.9 (latest main) |
-| PyTorch | 2.13.0a0+git8f75890 / 2.13.0.dev20260506+xpu |
+| PyTorch (XPU) | 2.13.0a0+git8f75890 / 2.13.0.dev20260506+xpu |
+| PyTorch (CUDA) | 2.12.0.dev20260407+cu128 |
 | icpx | oneAPI 2025.3 |
 
 ## Detailed Analysis

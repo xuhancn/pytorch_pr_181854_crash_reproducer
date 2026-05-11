@@ -1,4 +1,5 @@
 _build_standalone/
+_build_cuda/
 __pycache__/
 *.o
 *.so

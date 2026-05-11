@@ -224,15 +224,45 @@ flags) — do not trigger the bug. The ~6x size difference (34 KB vs 185+ KB) su
 that SPIR-V binary size or internal module complexity is a contributing factor in the
 Level Zero runtime's device code registration corruption.
 
+## CUDA Comparison — Apple-to-Apple Test (2026-05-11)
+
+The same 6-test load-order matrix was run on NVIDIA CUDA (RTX 5090 D, SM120) to
+determine whether the multi-.so dlopen crash is specific to Intel Level Zero or
+a general GPU driver issue.
+
+| Test | Sequence | XPU (BMG B60) | CUDA (RTX 5090 D) |
+|------|----------|---------------|-------------------|
+| A | plain kernel only | ✅ PASS | ✅ PASS |
+| B | EVT kernel only | ✅ PASS | ✅ PASS |
+| **C** | **load plain → load EVT → call plain** | **❌ DEVICE_LOST** | **✅ PASS** |
+| D | load EVT → load plain → call plain | ✅ PASS | ✅ PASS |
+| E | load plain → call plain → load EVT → call plain | ✅ PASS | ✅ PASS |
+| F | load plain → load EVT → call EVT | ✅ PASS | ✅ PASS |
+
+**Conclusion**: The DEVICE_LOST crash is **confirmed to be specific to the Intel
+Level Zero / SYCL runtime** on BMG/Xe2 GPUs. The CUDA driver correctly maintains
+separate device code modules loaded via `dlopen` — multiple `.so` files with CUDA
+device code coexist without interference.
+
+This validates that PyTorch inductor's `async_compile` pattern (compile kernel1.so →
+compile kernel2.so → `wait()` → call both kernels) is **safe on CUDA** but triggers
+a runtime bug on Intel Level Zero.
+
+See [cuda_test_results.md](cuda_test_results.md) for full CUDA test details including
+environment setup, unit test results, and SM120 architecture analysis.
+
 ## Environment
 
 | Component | Version |
 |-----------|---------|
-| GPU | Intel Arc Pro B60 (BMG/Xe2, 0xE20B, 20 Xe-cores, 22.7GB) |
+| GPU (XPU) | Intel Arc Pro B60 (BMG/Xe2, 0xE20B, 20 Xe-cores, 22.7GB) |
+| GPU (CUDA) | NVIDIA GeForce RTX 5090 D (SM120, Blackwell, 32GB VRAM) |
 | Level Zero Loader | 1.28.0 |
-| GPU Driver | 1.14.37435+12 (NEO 26.09.37435.12) |
-| sycl-tla | v0.8 (commit 2fc09973) |
-| PyTorch | 2.13.0a0+git8f75890 (xu_cutlass_evt_silu_fusion branch) |
+| GPU Driver (Intel) | 1.14.37435+12 (NEO 26.09.37435.12) |
+| CUDA Toolkit | 13.0 |
+| sycl-tla | v0.9 |
+| PyTorch (XPU) | 2.13.0a0+git8f75890 (xu_cutlass_evt_silu_fusion branch) |
+| PyTorch (CUDA) | 2.12.0.dev20260407+cu128 (nightly) |
 | icpx | oneAPI 2025.3 |
 | SYCL target | intel_gpu_bmg_g21 |
 
@@ -244,3 +274,4 @@ Level Zero runtime's device code registration corruption.
    pre-compile SPIR-V before loading the next `.so`
 3. **Test on other BMG devices** (Arc B580, B570, etc.) to confirm scope
 4. **Test on newer Level Zero drivers** once available
+5. **Test EVT integration on SM90+ (H100/B200)** — SM120 lacks standard f16 CUTLASS GEMMs
