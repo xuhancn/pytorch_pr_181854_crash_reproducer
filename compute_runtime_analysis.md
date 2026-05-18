@@ -440,6 +440,25 @@ Compiled fixed kernel sources with unique struct names and ran the full test mat
 **All 6 tests PASS with the fix.** Test C is the critical one — it was the only
 failing case and it now passes.
 
+### End-to-End Validation (PyTorch Build from Source)
+
+Built PyTorch from source (`torch-2.13.0a0+gitfa73e24`, branch `xu_cutlass_evt_silu_fusion`)
+with `USE_XPU=1` in a clean conda environment and ran the full CUTLASS backend test suite:
+
+| Test | Result |
+|------|:---:|
+| `test_evt_silu_fusion` | ✅ PASS |
+| `test_evt_llama_mlp_pattern` | ✅ PASS |
+| `test_evt_aux_load_mul` | ✅ PASS |
+| `test_py_codegen_neg_constant` | ✅ PASS |
+| `test_py_codegen_silu` | ✅ PASS |
+| `test_py_codegen_aux_load_mul` | ✅ PASS |
+| `test_py_codegen_silu_mul_aux` | ✅ PASS |
+| `test_max_autotune_cutlass_backend_regular_mm` (8 variants) | ✅ PASS |
+
+**All 15 tests pass.** The CUTLASS kernels correctly benchmark and execute with unique
+kernel names. Multiple `.so` files with different epilogues no longer conflict.
+
 ### Why This Fix Works
 
 1. The `KERNEL_NAME` placeholder already exists in PyTorch Inductor for the C function
