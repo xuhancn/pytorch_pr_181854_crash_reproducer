@@ -3,23 +3,103 @@
 ## Executive Summary
 
 The DEVICE_LOST crash on BMG/Xe2 GPUs when loading multiple SYCL kernel `.so` files
-via `dlopen` has been traced to a **GPU ISA memory alignment bug** in Intel's
-compute-runtime (NEO driver). BMG/Xe2 hardware requires **2MB-aligned GPU virtual
-addresses** for ISA (Instruction Set Architecture) allocations in local memory, but the
-driver was allocating ISA with only 64KB alignment (or no alignment at all in the ISA
-pool path). This causes GPU page faults during instruction fetch → `DEVICE_LOST`.
+via `dlopen` is caused by a **SYCL kernel name collision** in the CUTLASS SYCL library
+design. Both the "plain" and "EVT" CUTLASS kernel `.so` files embed device binaries
+(zebin) registered under the **same SYCL kernel class name**:
 
-The bug has been fixed in two commits tracked under **NEO-12287 / HSD-18042276431**.
-The user's driver version (`NEO 26.09.37435.12`) predates the fix.
+```
+cutlass3x_xe20_tensorop_gemm_f16_f16_f32_void_f16_df16_64x128x32_1x1x1_0_tnt_align8
+```
+
+When both `.so` files are loaded via `dlopen`, the SYCL `ProgramManager` has two
+different device binaries (44KB plain vs 66KB EVT) registered under the same kernel
+name. On kernel dispatch, the runtime selects the **wrong binary** (EVT's 66KB image
+instead of plain's 44KB image) → GPU executes incompatible code → **DEVICE_LOST**.
+
+**This is NOT a GPU driver bug.** It reproduces across all tested driver versions
+(26.09, 26.14, 26.18) including the absolute latest release. The previously suspected
+NEO-12287 (2MB ISA alignment) fix is a separate, unrelated issue.
+
+### Key Evidence
+
+| Test | Behavior | Binary Size at `urProgramCreateWithBinary` | Result |
+|------|----------|-------------------------------------------|--------|
+| A: load plain → call plain | Correct binary selected | **44,456 bytes** (plain) | ✅ PASS |
+| C: load plain → load evt → call plain | **Wrong binary selected** | **66,120 bytes** (evt!) | ❌ DEVICE_LOST |
+| D: load evt → load plain → call plain | Correct binary selected | 44,456 bytes (plain) | ✅ PASS |
+| E: load plain → call → load evt → call | Cached from first call | 44,456 bytes (plain) | ✅ PASS |
+
+---
+
+## True Root Cause: SYCL Kernel Name Collision
+
+### The Problem
+
+CUTLASS SYCL uses the **GEMM core type** as the SYCL kernel class name. The epilogue
+functor (plain `LinearCombination` vs complex EVT `Sm90TreeVisitor`) is passed as a
+**kernel argument** rather than as a template parameter that affects the kernel type name.
+
+This means different `.so` files with different CUTLASS epilogues produce device images
+with **identical kernel names but different compiled code**.
+
+```
+# Both .so files export this SAME kernel type name:
+_ZTS83cutlass3x_xe20_tensorop_gemm_f16_f16_f32_void_f16_df16_64x128x32_1x1x1_0_tnt_align8
+
+# kernel1_plain.so epilogue: ...FusionCallbacks<LinearCombination<f16,f,...>>...
+# kernel2_evt.so epilogue:   ...Sm90TreeVisitor<Sm90Compute<multiplies>...<SiLu>...<XeAuxLoad>...>...
+```
+
+### How the SYCL Runtime Fails
+
+1. `dlopen(kernel1_plain.so)` → `__sycl_register_lib` registers image A (44KB zebin)
+   with kernel name `cutlass3x_...align8`
+2. `dlopen(kernel2_evt.so)` → `__sycl_register_lib` registers image B (66KB zebin)
+   with the **same** kernel name `cutlass3x_...align8`
+3. User calls the plain kernel → SYCL runtime looks up `cutlass3x_...align8`
+4. `ProgramManager` finds **two** entries in `m_KernelIDs2BinImage` (multimap)
+5. `urDeviceSelectBinary` selects the **wrong** image (B instead of A)
+6. `urProgramCreateWithBinary` loads the 66KB EVT binary
+7. `urKernelCreate` creates a kernel with EVT code
+8. Kernel is dispatched with plain kernel's argument layout (416 bytes) but EVT's code
+   expects different arguments → **GPU HANG / DEVICE_LOST**
+
+### Why Load Order Matters
+
+- **Test C (plain first, evt second) → FAIL**: The multimap/lookup picks the last-
+  registered image (evt's binary) for the shared kernel name
+- **Test D (evt first, plain second) → PASS**: The lookup picks the last-registered
+  image (plain's binary), which is correct for calling plain
+- **Test E (call before loading evt) → PASS**: The kernel is compiled and cached
+  before the collision exists; subsequent calls use the cached kernel
+
+---
+
+## Previously Suspected: NEO-12287 (2MB ISA Alignment) — RULED OUT
+
+The NEO-12287 fix was previously suspected as the root cause but has been **definitively
+ruled out** through testing:
 
 ---
 
 ## Bug Tracker References
 
+### True Root Cause (Kernel Name Collision)
+
+- **Layer**: SYCL runtime (`intel/llvm`) ProgramManager + CUTLASS SYCL kernel naming
+- **Impact**: Any two CUTLASS `.so` files sharing GEMM core parameters but different
+  epilogues will collide
+- **Status**: **UNFIXED** — present in all tested driver/runtime versions
+- **Fix needed in**: CUTLASS SYCL (kernel naming must include epilogue type) OR
+  SYCL ProgramManager (must disambiguate images from different `.so` files)
+
+### Previously Suspected: NEO-12287 (Separate Issue, Fixed)
+
 - **Internal**: NEO-12287, HSD-18042276431
 - **Primary fix commit**: [`4078022318bca0dfb466c0aeba5a392f47abf7a0`](https://github.com/intel/compute-runtime/commit/4078022318bca0dfb466c0aeba5a392f47abf7a0) — *2025-11-19* — "fix: configure ISA Pool params based on productHelper"
 - **Secondary fix commit**: [`e2228201ce6da6e7ae657d7fa0d309d9a38d3912`](https://github.com/intel/compute-runtime/commit/e2228201ce6da6e7ae657d7fa0d309d9a38d3912) — *2025-05-30* — "fix: Avoid redundant padding in ISA allocations"
 - **Reverted earlier attempt**: [`bf20ae7ae82a468801a921f4d2e01b9d4b92eb0b`](https://github.com/intel/compute-runtime/commit/bf20ae7ae82a468801a921f4d2e01b9d4b92eb0b) (2025-02-19) → reverted by `f5e37e725cc47cae` (2025-03-10), then correctly re-landed as `4078022318bca0`
+- **Status**: Fixed in driver 26.14+, but **does NOT resolve this crash**
 
 ---
 
@@ -241,19 +321,11 @@ instruction fetch → page fault → **DEVICE_LOST**.
 
 ## What Was Investigated and Ruled Out
 
-### SYCL Runtime Layer (`intel/llvm`)
+### GPU Driver ISA Alignment (NEO-12287)
 
-The SYCL runtime's `ProgramManager` and device image registration were thoroughly
-analyzed across both the production (`sycl/source/detail/`) and new (`libsycl/src/detail/`)
-implementations:
-
-| Hypothesis | Status | Reason |
-|------------|--------|--------|
-| SPIR-V pointer invalidation across .so | ❌ Ruled out | UR adapter copies SPIR-V into `ILCode` at `urProgramCreateWithIL` |
-| `unordered_map` iterator/pointer invalidation | ❌ Ruled out | `m_DeviceKernelInfoMap` uses `std::string` keys; element addresses stable after rehash |
-| Kernel name collision between .so files | ❌ Ruled out | CUTLASS kernels have distinct SYCL names (different template params); `m_KernelIDs2BinImage` is a multimap |
-| `zeModuleCreate` called at `dlopen` time | ❌ Ruled out | Compilation is lazy — only at first kernel dispatch |
-| Data race on `m_EliminatedKernelArgMasks` | ⚠️ Real bug, not this issue | Write-without-lock in `addImage()`, but reproduces in single-threaded mode |
+The NEO-12287 fix (2MB ISA alignment for BMG) was tested with driver versions 26.14
+and 26.18 — the crash still reproduces. The alignment fix is correct but addresses a
+**different** failure mode (random ISA placement issues with large dedicated allocations).
 
 ### Cross-SO Handler/Allocator Hypothesis
 
@@ -302,14 +374,15 @@ uses `unordered_multimap` + `urDeviceSelectBinary` and handles this correctly.
 
 ## Environment and Driver Version
 
-| Component | Version | Has Fix? |
-|-----------|---------|----------|
+| Component | Version | Resolves Crash? |
+|-----------|---------|-----------------|
 | GPU | Intel Arc Pro B60 (BMG/Xe2, 0xE20B) | N/A (hardware) |
 | Level Zero Loader | 1.28.0 | N/A (loader only) |
-| GPU Driver (NEO) | **26.09.37435.12** (installed) | **❌ No** — fix landed 2025-11-19 |
-| GPU Driver (NEO) | **26.14.37833.4** (available in PPA) | **✅ Yes** — post-fix build |
-| Fix commit | `4078022318bca0` | In `master` since 2025-11-19 |
-| Earlier attempt | `bf20ae7a` (2025-02-19) | Reverted 2025-03-10 |
+| GPU Driver (NEO) | 26.09.37435.12 → **26.18.38308.1** (tested) | **❌ No** — this is NOT a driver bug |
+| IGC Compiler | 2.34.4 (tested) | **❌ No** — rebuilt .so still crashes |
+| SYCL Runtime | oneAPI 2025.3 + conda nightly (tested) | **❌ No** — crashes with both |
+
+**Tested driver versions**: 26.09.37435.12, 26.14.37833.4, 26.18.38308.1 — ALL reproduce the crash.
 
 **Package source**: `ppa:kobuk-team/intel-graphics` (Ubuntu 25.10 / Questing)
 
@@ -317,86 +390,62 @@ uses `unordered_multimap` + `urDeviceSelectBinary` and handles this correctly.
 
 ## Recommended Actions
 
-### Immediate: Update GPU Driver
+### Immediate Fix: Ensure Unique SYCL Kernel Names (CUTLASS-side fix)
 
-The fix is already available in the PPA. Version `26.14.37833.4` (build 37833) postdates
-the fix commit (2025-11-19) and should contain the 2MB ISA alignment fix for BMG.
+The root fix must be in **CUTLASS SYCL's kernel naming**. The SYCL kernel class type
+must include the epilogue type in its template parameters so that different epilogues
+produce different kernel names. This is a fix in PyTorch's CUTLASS codegen or in
+`sycl-tla` (CUTLASS SYCL fork).
 
-#### Upgrade Steps (Ubuntu 25.10 with `ppa:kobuk-team/intel-graphics`)
+### Workaround 1: JIT-Before-Load (Effective, Proven by Test E)
 
-```bash
-# 1. Update package index
-sudo apt-get update
+Force kernel compilation **before** loading the second `.so`:
 
-# 2. Upgrade GPU driver packages
-sudo apt-get upgrade -y libze-intel-gpu1 intel-opencl-icd
-
-# Or upgrade all PPA packages at once:
-# sudo apt-get dist-upgrade -y
-
-# 3. Reboot to load the new GPU driver
-sudo reboot
+```python
+# In PyTorch Inductor's CUTLASS codegen:
+# After dlopen(kernel1.so), immediately call the kernel once (or trigger JIT)
+# THEN dlopen(kernel2.so)
 ```
 
-#### If PPA is Not Yet Configured
+This works because once a kernel is compiled and cached, the SYCL ProgramManager
+uses the cached version and never re-does the binary lookup.
+
+### Workaround 2: Single `.so` (Avoids Collision Entirely)
+
+Combine both CUTLASS kernels into one `.so` file. With one device binary containing
+both kernels, there's no collision — each kernel has its own entry in the single zebin.
+
+### Workaround 3: Disable EVT Fusion
+
+`cutlass_epilogue_fusion_enabled=False` avoids the second CUTLASS `.so` entirely.
+
+### Long-term Fix Options
+
+1. **CUTLASS SYCL kernel naming**: Include epilogue type hash in the SYCL kernel class
+   name template parameter to ensure uniqueness across different epilogue configurations.
+
+2. **SYCL ProgramManager**: When multiple device images define the same kernel name,
+   the runtime should disambiguate by `.so` origin (e.g., using the `sycl_device_binary`
+   pointer identity or the source library handle).
+
+3. **PyTorch Inductor**: Generate unique kernel class names per `.so` by adding a
+   hash suffix to the kernel type name.
+
+### GPU Driver Upgrade (For NEO-12287 Separately)
+
+The 2MB ISA alignment issue (NEO-12287) is a separate real bug that may affect other
+scenarios. If you want the latest driver for other stability improvements:
 
 ```bash
-# Add the Intel graphics PPA (Ubuntu 25.10)
-sudo add-apt-repository ppa:kobuk-team/intel-graphics
-sudo apt-get update
-sudo apt-get install -y libze-intel-gpu1 intel-opencl-icd level-zero
+# Latest release from GitHub (26.18.38308.1):
+mkdir -p /tmp/neo && cd /tmp/neo
+wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.34.4/intel-igc-core-2_2.34.4+21428_amd64.deb
+wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.34.4/intel-igc-opencl-2_2.34.4+21428_amd64.deb
+wget https://github.com/intel/compute-runtime/releases/download/26.18.38308.1/libze-intel-gpu1_26.18.38308.1-0_amd64.deb
+wget https://github.com/intel/compute-runtime/releases/download/26.18.38308.1/intel-opencl-icd_26.18.38308.1-0_amd64.deb
+wget https://github.com/intel/compute-runtime/releases/download/26.18.38308.1/libigdgmm12_22.10.0_amd64.deb
+sudo dpkg -i *.deb
 ```
-
-#### Alternative: Intel Official Repository
-
-For non-Ubuntu or enterprise setups, Intel provides packages at
-https://dgpu-docs.intel.com/driver/client/overview.html:
-
-```bash
-# Add Intel GPU repository key and source (example for Ubuntu 24.04+)
-wget -qO - https://repositories.intel.com/gpu/intel-graphics.key | \
-  sudo gpg --dearmor -o /usr/share/keyrings/intel-graphics.gpg
-echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
-  https://repositories.intel.com/gpu/ubuntu noble unified" | \
-  sudo tee /etc/apt/sources.list.d/intel-gpu.list
-sudo apt-get update
-sudo apt-get install -y intel-opencl-icd intel-level-zero-gpu
-```
-
-### Verification
-
-```bash
-# Check installed version after upgrade:
-dpkg -l libze-intel-gpu1 | grep intel
-# Expected: 26.14.37833.4-1~25.10~ppa1 or newer
-
-# Verify GPU is functional:
-clinfo | grep "Device Name"
-# Expected: Intel(R) Arc(TM) Pro B60 Graphics
-
-# Quick Level Zero sanity check:
-ze_info 2>/dev/null || echo "ze_info not installed (optional)"
-
-# Run the reproducer to confirm the fix:
-cd /path/to/pytorch_pr_181854_crash_reproducer
-python standalone_repro_evt.py
-# Expected: No DEVICE_LOST, all tests pass
-```
-
-### PyTorch Inductor Workaround (Until Driver Update)
-
-The existing workarounds documented in `evt_device_lost_analysis.md` remain effective:
-
-1. **JIT-on-load**: Force SPIR-V → ISA compilation immediately after each `dlopen`,
-   before loading the next `.so`. This reduces the chance of the heap allocator placing
-   ISA at non-2MB-aligned addresses (though it's not a guaranteed fix).
-
-2. **Single `.so`**: Combine both CUTLASS kernels into one `.so` file. With one
-   `zeModuleCreate` call, both kernels' ISA is allocated as a single contiguous block,
-   more likely to be 2MB-aligned.
-
-3. **Disable EVT fusion**: `cutlass_epilogue_fusion_enabled=False` avoids the second
-   large CUTLASS `.so` entirely.
 
 ---
 
