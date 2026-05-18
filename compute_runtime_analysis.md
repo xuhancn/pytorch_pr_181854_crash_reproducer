@@ -306,9 +306,12 @@ uses `unordered_multimap` + `urDeviceSelectBinary` and handles this correctly.
 |-----------|---------|----------|
 | GPU | Intel Arc Pro B60 (BMG/Xe2, 0xE20B) | N/A (hardware) |
 | Level Zero Loader | 1.28.0 | N/A (loader only) |
-| GPU Driver (NEO) | **26.09.37435.12** | **❌ No** — fix landed 2025-11-19 |
+| GPU Driver (NEO) | **26.09.37435.12** (installed) | **❌ No** — fix landed 2025-11-19 |
+| GPU Driver (NEO) | **26.14.37833.4** (available in PPA) | **✅ Yes** — post-fix build |
 | Fix commit | `4078022318bca0` | In `master` since 2025-11-19 |
 | Earlier attempt | `bf20ae7a` (2025-02-19) | Reverted 2025-03-10 |
+
+**Package source**: `ppa:kobuk-team/intel-graphics` (Ubuntu 25.10 / Questing)
 
 ---
 
@@ -316,23 +319,68 @@ uses `unordered_multimap` + `urDeviceSelectBinary` and handles this correctly.
 
 ### Immediate: Update GPU Driver
 
-Upgrade to a compute-runtime build that includes commit `4078022318bca0` (2025-11-19 or
-later). This can be obtained from:
+The fix is already available in the PPA. Version `26.14.37833.4` (build 37833) postdates
+the fix commit (2025-11-19) and should contain the 2MB ISA alignment fix for BMG.
 
-1. **Intel package repositories** — look for NEO driver packages dated after Nov 2025
-2. **Building from source** — `intel/compute-runtime` `master` branch contains the fix
-3. **oneAPI toolkit update** — future oneAPI releases (2025.4+) should bundle the fixed driver
+#### Upgrade Steps (Ubuntu 25.10 with `ppa:kobuk-team/intel-graphics`)
+
+```bash
+# 1. Update package index
+sudo apt-get update
+
+# 2. Upgrade GPU driver packages
+sudo apt-get upgrade -y libze-intel-gpu1 intel-opencl-icd
+
+# Or upgrade all PPA packages at once:
+# sudo apt-get dist-upgrade -y
+
+# 3. Reboot to load the new GPU driver
+sudo reboot
+```
+
+#### If PPA is Not Yet Configured
+
+```bash
+# Add the Intel graphics PPA (Ubuntu 25.10)
+sudo add-apt-repository ppa:kobuk-team/intel-graphics
+sudo apt-get update
+sudo apt-get install -y libze-intel-gpu1 intel-opencl-icd level-zero
+```
+
+#### Alternative: Intel Official Repository
+
+For non-Ubuntu or enterprise setups, Intel provides packages at
+https://dgpu-docs.intel.com/driver/client/overview.html:
+
+```bash
+# Add Intel GPU repository key and source (example for Ubuntu 24.04+)
+wget -qO - https://repositories.intel.com/gpu/intel-graphics.key | \
+  sudo gpg --dearmor -o /usr/share/keyrings/intel-graphics.gpg
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
+  https://repositories.intel.com/gpu/ubuntu noble unified" | \
+  sudo tee /etc/apt/sources.list.d/intel-gpu.list
+sudo apt-get update
+sudo apt-get install -y intel-opencl-icd intel-level-zero-gpu
+```
 
 ### Verification
 
 ```bash
-# Check if the fix is present in the installed driver:
-# The fix adds is2MBLocalMemAlignmentEnabled() checks in ISA allocation paths.
-# Look for the new getIsaAllocationPageSize() method or 2MB alignment in ISA pool:
-strings /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1 | grep -i "2MB"
+# Check installed version after upgrade:
+dpkg -l libze-intel-gpu1 | grep intel
+# Expected: 26.14.37833.4-1~25.10~ppa1 or newer
 
-# Or check the driver version against the fix date:
-# NEO builds after 2025-11-19 should contain the fix
+# Verify GPU is functional:
+clinfo | grep "Device Name"
+# Expected: Intel(R) Arc(TM) Pro B60 Graphics
+
+# Quick Level Zero sanity check:
+ze_info 2>/dev/null || echo "ze_info not installed (optional)"
+
+# Run the reproducer to confirm the fix:
+cd /path/to/pytorch_pr_181854_crash_reproducer
+python standalone_repro_evt.py
+# Expected: No DEVICE_LOST, all tests pass
 ```
 
 ### PyTorch Inductor Workaround (Until Driver Update)
