@@ -84,14 +84,14 @@ ruled out** through testing:
 
 ## Bug Tracker References
 
-### True Root Cause (Kernel Name Collision)
+### True Root Cause (Kernel Name Collision) — **FIXED** ✅
 
-- **Layer**: SYCL runtime (`intel/llvm`) ProgramManager + CUTLASS SYCL kernel naming
+- **Layer**: PyTorch Inductor CUTLASS codegen (`gemm_template.py`)
 - **Impact**: Any two CUTLASS `.so` files sharing GEMM core parameters but different
   epilogues will collide
-- **Status**: **UNFIXED** — present in all tested driver/runtime versions
-- **Fix needed in**: CUTLASS SYCL (kernel naming must include epilogue type) OR
-  SYCL ProgramManager (must disambiguate images from different `.so` files)
+- **Status**: **FIXED** — unique SYCL kernel class names via `KERNEL_NAME` hash suffix
+- **Fix location**: `torch/_inductor/codegen/cutlass/gemm_template.py` →
+  `CUTLASS3xGemmTemplate._define_gemm_instance()`
 
 ### Previously Suspected: NEO-12287 (Separate Issue, Fixed)
 
@@ -388,48 +388,74 @@ uses `unordered_multimap` + `urDeviceSelectBinary` and handles this correctly.
 
 ---
 
-## Recommended Actions
+## Fix: Unique SYCL Kernel Names via Inductor Codegen (Verified ✅)
 
-### Immediate Fix: Ensure Unique SYCL Kernel Names (CUTLASS-side fix)
+### The Fix (PyTorch Inductor — `gemm_template.py`)
 
-The root fix must be in **CUTLASS SYCL's kernel naming**. The SYCL kernel class type
-must include the epilogue type in its template parameters so that different epilogues
-produce different kernel names. This is a fix in PyTorch's CUTLASS codegen or in
-`sycl-tla` (CUTLASS SYCL fork).
+The fix is in `CUTLASS3xGemmTemplate._define_gemm_instance()` in
+`torch/_inductor/codegen/cutlass/gemm_template.py`. For XPU/SYCL targets, the CUTLASS
+kernel struct name is made unique by appending the `KERNEL_NAME` placeholder, which
+`scheduling.py` replaces with a per-`.so` SHA-256 hash.
 
-### Workaround 1: JIT-Before-Load (Effective, Proven by Test E)
-
-Force kernel compilation **before** loading the second `.so`:
-
+**Before** (both `.so` files get the same struct → same SYCL kernel class name):
 ```python
-# In PyTorch Inductor's CUTLASS codegen:
-# After dlopen(kernel1.so), immediately call the kernel once (or trigger JIT)
-# THEN dlopen(kernel2.so)
+op_type = match.groups()[0]  # "cutlass3x_..._align8"
+op_def += f"\n  using {op_type}_device_type = GemmUniversalAdapter<{op_type}>;\n"
 ```
 
-This works because once a kernel is compiled and cached, the SYCL ProgramManager
-uses the cached version and never re-does the binary lookup.
+**After** (each `.so` gets a unique struct name → unique SYCL kernel class name):
+```python
+op_type = match.groups()[0]  # "cutlass3x_..._align8"
+if self.device_type == "xpu":
+    unique_op_type = f"{op_type}_{Placeholder.KERNEL_NAME}"
+    op_def = op_def.replace(f"struct {op_type} :", f"struct {unique_op_type} :")
+    op_def += f"\n  using {unique_op_type}_device_type = GemmUniversalAdapter<{unique_op_type}>;\n"
+```
 
-### Workaround 2: Single `.so` (Avoids Collision Entirely)
+After `scheduling.py` replaces `KERNEL_NAME` → `cutlass_fused_mm_t_ccb68346`:
+```
+# kernel1_plain.so struct name:
+cutlass3x_..._align8_cutlass_fused_mm_t_ccb68346
 
-Combine both CUTLASS kernels into one `.so` file. With one device binary containing
-both kernels, there's no collision — each kernel has its own entry in the single zebin.
+# kernel2_evt.so struct name:
+cutlass3x_..._align8_cutlass_fused_mm_mul_silu_t_02f33700
+```
 
-### Workaround 3: Disable EVT Fusion
+The SYCL `ProgramManager` now sees **different** kernel class names → selects the
+correct device binary for each kernel → **no more DEVICE_LOST**.
 
-`cutlass_epilogue_fusion_enabled=False` avoids the second CUTLASS `.so` entirely.
+### Verification Results
 
-### Long-term Fix Options
+Compiled fixed kernel sources with unique struct names and ran the full test matrix:
 
-1. **CUTLASS SYCL kernel naming**: Include epilogue type hash in the SYCL kernel class
-   name template parameter to ensure uniqueness across different epilogue configurations.
+| Test | Original (Bug) | Fixed |
+|------|:---:|:---:|
+| A: plain only | ✅ PASS | ✅ PASS |
+| B: evt only | ✅ PASS | ✅ PASS |
+| **C: load plain → load evt → call plain** | **❌ DEVICE_LOST** | **✅ PASS** |
+| D: load evt → load plain → call plain | ✅ PASS | ✅ PASS |
+| E: load plain → call → load evt → call | ✅ PASS | ✅ PASS |
+| F: load plain → load evt → call evt | ✅ PASS | ✅ PASS |
 
-2. **SYCL ProgramManager**: When multiple device images define the same kernel name,
-   the runtime should disambiguate by `.so` origin (e.g., using the `sycl_device_binary`
-   pointer identity or the source library handle).
+**All 6 tests PASS with the fix.** Test C is the critical one — it was the only
+failing case and it now passes.
 
-3. **PyTorch Inductor**: Generate unique kernel class names per `.so` by adding a
-   hash suffix to the kernel type name.
+### Why This Fix Works
+
+1. The `KERNEL_NAME` placeholder already exists in PyTorch Inductor for the C function
+   name (`extern "C" int KERNEL_NAME(...)`)
+2. `scheduling.py:107` does a global text replace: `src_code.replace("KERNEL_NAME", kernel_name)`
+   where `kernel_name` is a unique per-`.so` SHA-256 hash (e.g., `cutlass_fused_mm_t_ccb68346`)
+3. By embedding `KERNEL_NAME` in the struct name, the same replacement automatically
+   makes the struct unique → the SYCL kernel class name becomes unique
+4. The fix is scoped to `device_type == "xpu"` only, with zero impact on CUDA
+
+### Workarounds (If Fix Cannot Be Applied)
+
+1. **JIT-Before-Load** (Proven by Test E): Force kernel compilation before loading the
+   second `.so`. Once cached, the SYCL runtime uses the cached kernel.
+2. **Single `.so`**: Combine all CUTLASS kernels into one shared object.
+3. **Disable EVT Fusion**: `cutlass_epilogue_fusion_enabled=False`
 
 ### GPU Driver Upgrade (For NEO-12287 Separately)
 
